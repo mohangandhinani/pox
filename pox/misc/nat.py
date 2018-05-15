@@ -1,464 +1,362 @@
-# Copyright 2013 James McCauley
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at:
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-A kind of sloppy NAT component.
-
-Required commandline parameters:
-  --dpid            The DPID to NAT-ize
-  --outside-port=X  The port on DPID that connects "upstream" (e.g, "eth0")
-
-Optional parameters:
-  --subnet=X        The local subnet to use (e.g., "192.168.0.1/24")
-  --inside-ip=X     The inside-facing IP address the switch will claim to be
-
-To get this to work with Open vSwitch, you probably have to disable OVS's
-in-band control with something like:
-  ovs-vsctl set bridge s1 other-config:disable-in-band=true
-
-Please submit improvements. :)
-"""
-
-from pox.core import core
-import pox
-log = core.getLogger()
-
-from pox.lib.packet.ipv4 import ipv4
-from pox.lib.packet.arp import arp
-import pox.lib.packet as pkt
-
-from pox.lib.addresses import IPAddr
-from pox.lib.addresses import EthAddr
-from pox.lib.util import str_to_bool, dpid_to_str, str_to_dpid
-from pox.lib.revent import EventMixin, Event
-from pox.lib.recoco import Timer
-import pox.lib.recoco as recoco
-
 import pox.openflow.libopenflow_01 as of
-from pox.proto.dhcpd import DHCPD, SimpleAddressPool
-
-import time
+from pox.core import core
+from pox.lib.addresses import EthAddr
+from pox.lib.addresses import IPAddr
+from pox.lib.packet.arp import arp
+from pox.lib.packet.ethernet import ethernet, ETHER_BROADCAST
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.util import dpid_to_str, str_to_bool
 import random
 
-FLOW_TIMEOUT = 60
-FLOW_MEMORY_TIMEOUT = 60 * 10
+log = core.getLogger()
+ip_vlan_dict = {}
+ip_vlan_reverse_dict = {}
+
+vlan = 0
+switch3f = 0000000000000003
+flow3fmsg = of.ofp_flow_mod()
+nat_trans = {}
+nat_reverse_trans = {}
+
+blocked_ips = set()
+blocked_ips.add('192.168.1.10')
 
 
-class Record (object):
-  def __init__ (self):
-    self.touch()
-    self.outgoing_match = None
-    self.incoming_match = None
-    self.real_srcport = None
-    self.fake_srcport = None
-    self.outgoing_fm = None
-    self.incoming_fm = None
+def flow_3f(inport, input_ip, trans_port, original_port, vlan=0, out_port=2):
+    # flow1:
 
-  @property
-  def expired (self):
-    return time.time() > self._expires_at
+    flow3fmsg.cookie = 0
 
-  def touch (self):
-    self._expires_at = time.time() + FLOW_MEMORY_TIMEOUT
+    flow3fmsg.match.in_port = inport
 
-  def __str__ (self):
-    s = "%s:%s" % (self.outgoing_match.nw_src, self.real_srcport)
-    if self.fake_srcport != self.real_srcport:
-      s += "/%s" % (self.fake_srcport,)
-    s += " -> %s:%s" % (self.outgoing_match.nw_dst, self.outgoing_match.tp_dst)
-    return s
+    flow3fmsg.match.dl_type = 0x0800
+
+    flow3fmsg.match.nw_src = IPAddr(input_ip)
+    flow3fmsg.match.nw_proto = 6
+    flow3fmsg.match.tp_src = original_port
+
+    # ACTIONS---------------------------------
+
+    flow3ftrans = of.ofp_action_tp_port.set_src(trans_port)
+    flow3fout = of.ofp_action_output(port=out_port)
+
+    flow3fsrcIP = of.ofp_action_nw_addr.set_src(IPAddr("10.0.0.2"))
+
+    flow3fsrcMAC = of.ofp_action_dl_addr.set_src(EthAddr("00:00:00:00:00:05"))
+
+    flow3fdstMAC = of.ofp_action_dl_addr.set_dst(EthAddr("00:00:00:00:00:06"))
+    flow3fvlanid = of.ofp_action_vlan_vid(vlan_vid=vlan)
+
+    flow3fmsg.actions = [flow3ftrans, flow3fsrcIP, flow3fsrcMAC, flow3fdstMAC, flow3fvlanid, flow3fout]
+    return flow3fmsg
 
 
-class NAT (object):
-  def __init__ (self, inside_ip, outside_ip, gateway_ip, dns_ip, outside_port,
-      dpid, subnet = None):
+# flow3b:
+def flow_3b(trans_port, out_port, out_ip, out_mac, original_port):
+    switch3b = 0000000000000003
 
-    self.inside_ip = inside_ip
-    self.outside_ip = outside_ip
-    self.gateway_ip = gateway_ip
-    self.dns_ip = dns_ip # Or None
-    self.outside_port = outside_port
-    self.dpid = dpid
-    self.subnet = subnet
+    flow3bmsg = of.ofp_flow_mod()
 
-    self._outside_portno = None
-    self._gateway_eth = None
-    self._connection = None
+    flow3bmsg.cookie = 0
 
-    # Which NAT ports have we used?
-    # proto means TCP or UDP
-    self._used_ports = set() # (proto,port)
+    flow3bmsg.match.in_port = 2
 
-    # Flow records indexed in both directions
-    # match -> Record
-    self._record_by_outgoing = {}
-    self._record_by_incoming = {}
+    flow3bmsg.match.dl_type = 0x0800
 
-    core.listen_to_dependencies(self)
+    flow3bmsg.match.nw_dst = IPAddr("10.0.0.2")
+    flow3bmsg.match.nw_proto = 6
+    flow3bmsg.match.tp_dst = trans_port
+    # ACTIONS---------------------------------
 
-  def _all_dependencies_met (self):
-    log.debug('Trying to start...')
-    if self.dpid in core.openflow.connections:
-      self._start(core.openflow.connections[self.dpid])
+    flow3bout = of.ofp_action_output(port=out_port)
+
+    flow3bdstIP = of.ofp_action_nw_addr.set_dst(IPAddr(out_ip))
+
+    flow3bsrcMAC = of.ofp_action_dl_addr.set_src(EthAddr("00:00:00:00:00:04"))
+
+    flow3bdstMAC = of.ofp_action_dl_addr.set_dst(EthAddr(out_mac))
+    flow3btrans = of.ofp_action_tp_port.set_dst(original_port)
+
+    flow3bmsg.actions = [flow3bdstIP, flow3bsrcMAC, flow3bdstMAC, flow3btrans, flow3bout]
+    return flow3bmsg
+
+
+# flow1:
+def flow_4f(vlanid):
+
+    ip = ip_vlan_reverse_dict[vlanid]
+    #print "flow4f ip - {0}".format(ip)
+    flow4fmsg = of.ofp_flow_mod()
+    flow4fmsg.cookie = 0
+    flow4fmsg.match.in_port = 1
+    #flow4fmsg.match.dl_type = 0x8100
+    flow4fmsg.match.dl_vlan = vlanid
+    flow4fmsg.hard_timeout = 60
+    print blocked_ips
+
+    # Clear blocked_ips
+    # READ FROM FILE AND UPDATE blocked_ips
+    with open("/home/mininet/pox/pox/misc/blocked_ips.txt","r") as f:
+        b_l = []
+        for i in f:
+            b_l.append(i.strip())
+    global blocked_ips
+    blocked_ips = b_l
+    if str(ip) not in blocked_ips:
+    #if True:
+        #flow4fmsg.match.nw_src = IPAddr("10.0.0.2")
+
+        # ACTIONS---------------------------------
+        flow4fout = of.ofp_action_output(port=2)
+        # flow4fsrcIP = of.ofp_action_nw_addr.set_src(IPAddr("10.0.0.2"))
+        flow4fsrcMAC = of.ofp_action_dl_addr.set_src(EthAddr("00:00:00:00:00:03"))
+        flow4fdstMAC = of.ofp_action_dl_addr.set_dst(EthAddr("00:00:00:00:00:01"))
+        flow4fvlanid = of.ofp_action_vlan_vid(vlan_vid=0)
+
+        flow4fmsg.actions = [flow4fsrcMAC, flow4fdstMAC, flow4fvlanid, flow4fout]
     else:
-      core.openflow.addListenerByName('ConnectionUp',
-          self.__handle_dpid_ConnectionUp)
+        print "IP is blocked"
+    return flow4fmsg
 
-    self.expire_timer = Timer(60, self._expire, recurring = True)
+# flow1:
+def flow_4b():
+    switch4b = 0000000000000004
 
-  def _expire (self):
-    dead = []
-    for r in self._record_by_outgoing.itervalues():
-      if r.expired:
-        dead.append(r)
+    flow4bmsg = of.ofp_flow_mod()
 
-    for r in dead:
-      del self._record_by_outgoing[r.outgoing_match]
-      del self._record_by_incoming[r.incoming_match]
-      self._used_ports.remove((r.outgoing_match.nw_proto,r.fake_srcport))
+    flow4bmsg.cookie = 0
 
-    if dead and not self._record_by_outgoing:
-      log.debug("All flows expired")
+    flow4bmsg.match.in_port = 2
 
-  def _is_local (self, ip):
-    if ip.is_multicast: return True
-    if self.subnet is not None:
-      if ip.in_network(self.subnet): return True
-      return False
-    if ip.in_network('192.168.0.0/16'): return True
-    if ip.in_network('10.0.0.0/8'): return True
-    if ip.in_network('172.16.0.0/12'): return True
-    return False
+    flow4bmsg.match.dl_type = 0x0800
 
-  def _pick_port (self, flow):
-    """
-    Gets a possibly-remapped outside port
+    # flow4bmsg.match.nw_src = IPAddr("10.0.0.2")
 
-    flow is the match of the connection
-    returns port (maybe from flow, maybe not)
-    """
+    # ACTIONS---------------------------------
 
-    port = flow.tp_src
+    flow4bout = of.ofp_action_output(port=1)
 
-    if port < 1024:
-      # Never allow these
-      port = random.randint(49152, 65534)
+    # flow4bsrcIP = of.ofp_action_nw_addr.set_src(IPAddr("10.0.0.2"))
 
-    # Pretty sloppy!
+    flow4bsrcMAC = of.ofp_action_dl_addr.set_src(EthAddr("00:00:00:00:00:06"))
 
-    cycle = 0
-    while cycle < 2:
-      if (flow.nw_proto,port) not in self._used_ports:
-        self._used_ports.add((flow.nw_proto,port))
-        return port
-      port += 1
-      if port >= 65534:
-        port = 49152
-        cycle += 1
+    flow4bdstMAC = of.ofp_action_dl_addr.set_dst(EthAddr("00:00:00:00:00:05"))
+    #flow4bvlanid = of.ofp_action_vlan_vid()
 
-    log.warn("No ports to give!")
-    return None
+    flow4bmsg.actions = [flow4bsrcMAC, flow4bdstMAC, flow4bout]
 
-  @property
-  def _outside_eth (self):
-    if self._connection is None: return None
-    #return self._connection.eth_addr
-    return self._connection.ports[self._outside_portno].hw_addr
+    return flow4bmsg
 
-  def _handle_FlowRemoved (self, event):
-    pass
+def install_flows(event, vlan, input_ip, trans_port, original_port):
+    log.info("    *** Installing static flows... ***")
 
-  @staticmethod
-  def strip_match (o):
-    m = of.ofp_match()
+    # Push flows to switches
 
-    fields = 'dl_dst dl_src nw_dst nw_src tp_dst tp_src dl_type nw_proto'
+    if event.dpid == 3:
+        global switch
+        flow3fmsg = flow_3f(inport=event.port, input_ip=input_ip, original_port = original_port, trans_port=trans_port, vlan=vlan, out_port=2)
+        flow3bmsg = flow_3b(trans_port = trans_port, out_port = event.port, out_ip = input_ip, out_mac = event.parsed.src, original_port = original_port)
+        core.openflow.sendToDPID(3, flow3fmsg)
+        core.openflow.sendToDPID(3, flow3bmsg)
 
-    for f in fields.split():
-      setattr(m, f, getattr(o, f))
+    elif event.dpid == 4:
+        flow4fmsg = flow_4f(vlan)
+        flow4bmsg = flow_4b()
+        core.openflow.sendToDPID(4, flow4fmsg)
+        core.openflow.sendToDPID(4, flow4bmsg)
 
-    return m
-
-  @staticmethod
-  def make_match (o):
-    return NAT.strip_match(of.ofp_match.from_packet(o))
-
-  def _handle_PacketIn (self, event):
-    if self._outside_eth is None: return
-
-    #print
-    #print "PACKET",event.connection.ports[event.port].name,event.port,
-    #print self.outside_port, self.make_match(event.ofp)
-
-    incoming = event.port == self._outside_portno
-
-    if self._gateway_eth is None:
-      # Need to find gateway MAC -- send an ARP
-      self._arp_for_gateway()
-      return
-
-    packet = event.parsed
-    dns_hack = False
-
-    # We only handle TCP and UDP
-    tcpp = packet.find('tcp')
-    if not tcpp:
-      tcpp = packet.find('udp')
-      if not tcpp: return
-      if tcpp.dstport == 53 and tcpp.prev.dstip == self.inside_ip:
-        if self.dns_ip and not incoming:
-          # Special hack for DNS since we've lied and claimed to be the server
-          dns_hack = True
-    ipp = tcpp.prev
-
-    if not incoming:
-      # Assume we only NAT public addresses
-      if self._is_local(ipp.dstip) and not dns_hack: return
     else:
-      # Assume we only care about ourselves
-      if ipp.dstip != self.outside_ip: return
+        log.info(" INVALID CASE OF installing flows")
+    log.info("    *** Static flows installed. ***")
 
-    match = self.make_match(event.ofp)
 
-    if incoming:
-      match2 = match.clone()
-      match2.dl_dst = None # See note below
-      record = self._record_by_incoming.get(match2)
-      if record is None:
-        # Ignore for a while
-        fm = of.ofp_flow_mod()
-        fm.idle_timeout = 1
-        fm.hard_timeout = 10
-        fm.match = of.ofp_match.from_packet(event.ofp)
-        event.connection.send(fm)
+def _handle_ConnectionUp(event):
+    log.info("*** install flows *** {0}".format(str(event.dpid)))
+    """
+    if event.dpid == 4:
+        flow4fmsg = flow_4f(1)
+        flow4bmsg = flow_4b()
+        core.openflow.sendToDPID(4, flow4fmsg)
+        core.openflow.sendToDPID(4, flow4bmsg)
+    """
+    return
+
+def get_free_vlan():
+    global vlan
+    vlan = vlan + 1
+    return vlan
+
+
+def get_free_port(ip, port):
+    for _ in xrange(10):
+        a = random.randint(49152, 65534)
+        if a not in nat_reverse_trans:
+            nat_trans[str(ip) + "_" + str(port)] = a
+            nat_reverse_trans[a] = str(ip) + "_" + str(port)
+            return a
+
+
+def _handle_PacketIn(event):
+    log.info("*** _handle_PacketIn... ***{0}, {1}".format(str(event.dpid), event.port))
+
+    dpid = event.connection.dpid
+
+    inport = event.port
+
+    packet = event.parse()
+    if not packet.parsed:
+        log.warning("%i %i ignoring unparsed packet", dpid, inport)
+
         return
-      log.debug("%s reinstalled", record)
-      record.incoming_fm.data = event.ofp # Hacky!
-    else:
-      record = self._record_by_outgoing.get(match)
-      if record is None:
-        record = Record()
 
-        record.real_srcport = tcpp.srcport
-        record.fake_srcport = self._pick_port(match)
+    a = packet.find('arp')
 
-        # Outside heading in
-        fm = of.ofp_flow_mod()
-        fm.flags |= of.OFPFF_SEND_FLOW_REM
-        fm.hard_timeout = FLOW_TIMEOUT
+    if not a:
+        if True:
+            tcpp = packet.find('tcp')
+            if not tcpp:
+                tcpp = packet.find('udp')
+                if not tcpp:
+                    print "Not a good packet"
+                    return
+            print "finally a tcp packet"
 
-        fm.match = match.flip()
-        fm.match.in_port = self._outside_portno
-        fm.match.nw_dst = self.outside_ip
-        fm.match.tp_dst = record.fake_srcport
-        fm.match.dl_src = self._gateway_eth
+            if dpid == 3:
+                port = tcpp.srcport
+                ip = tcpp.prev.srcip
+                print ip
+                trans_port = 0
+                identifier = str(port) + "_" + str(ip)
+                if identifier not in nat_trans:
+                    trans_port = get_free_port(ip, port)
+                else:
+                    trans_port = nat_trans[identifier]
 
-        # We should set dl_dst, but it can get in the way.  Why?  Because
-        # in some situations, the ARP may ARP for and get the local host's
-        # MAC, but in others it may not.
-        #fm.match.dl_dst = self._outside_eth
-        fm.match.dl_dst = None
+                if ip not in ip_vlan_dict:
+                    ip_vlan_dict[ip] = get_free_vlan()
+                    ip_vlan_reverse_dict[ip_vlan_dict[ip]] = ip
+                vlan = ip_vlan_dict.get(ip, 0)
+                print "About to install a flow ({0}, {1}) -> {2} came on port {3}".format(str(ip), str(port), str(trans_port), str(inport))
+                install_flows(event=event, vlan=vlan, input_ip=ip, trans_port=trans_port, original_port=port)
+            else:
+                vlan = packet.find('vlan')
+                if vlan:
+                    vlan_id = vlan.id
+                else:
+                    vlan_id = 0
 
-        fm.actions.append(of.ofp_action_dl_addr.set_src(packet.dst))
-        fm.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
-        fm.actions.append(of.ofp_action_nw_addr.set_dst(ipp.srcip))
-
-        if dns_hack:
-          fm.match.nw_src = self.dns_ip
-          fm.actions.append(of.ofp_action_nw_addr.set_src(self.inside_ip))
-        if record.fake_srcport != record.real_srcport:
-          fm.actions.append(of.ofp_action_tp_port.set_dst(record.real_srcport))
-
-        fm.actions.append(of.ofp_action_output(port = event.port))
-
-        record.incoming_match = self.strip_match(fm.match)
-        record.incoming_fm = fm
-
-        # Inside heading out
-        fm = of.ofp_flow_mod()
-        fm.data = event.ofp
-        fm.flags |= of.OFPFF_SEND_FLOW_REM
-        fm.hard_timeout = FLOW_TIMEOUT
-        fm.match = match.clone()
-        fm.match.in_port = event.port
-        fm.actions.append(of.ofp_action_dl_addr.set_src(self._outside_eth))
-        fm.actions.append(of.ofp_action_nw_addr.set_src(self.outside_ip))
-        if dns_hack:
-          fm.actions.append(of.ofp_action_nw_addr.set_dst(self.dns_ip))
-        if record.fake_srcport != record.real_srcport:
-          fm.actions.append(of.ofp_action_tp_port.set_src(record.fake_srcport))
-        fm.actions.append(of.ofp_action_dl_addr.set_dst(self._gateway_eth))
-        fm.actions.append(of.ofp_action_output(port = self._outside_portno))
-
-        record.outgoing_match = self.strip_match(fm.match)
-        record.outgoing_fm = fm
-
-        self._record_by_incoming[record.incoming_match] = record
-        self._record_by_outgoing[record.outgoing_match] = record
-
-        log.debug("%s installed", record)
-      else:
-        log.debug("%s reinstalled", record)
-        record.outgoing_fm.data = event.ofp # Hacky!
-
-    record.touch()
-
-    # Send/resend the flow mods
-    if incoming:
-      data = record.outgoing_fm.pack() + record.incoming_fm.pack()
-    else:
-      data = record.incoming_fm.pack() + record.outgoing_fm.pack()
-    self._connection.send(data)
-
-    # We may have set one of the data fields, but they should be reset since
-    # they won't be valid in the future.  Kind of hacky.
-    record.outgoing_fm.data = None
-    record.incoming_fm.data = None
-
-  def __handle_dpid_ConnectionUp (self, event):
-    if event.dpid != self.dpid:
-      return
-    self._start(event.connection)
-
-  def _start (self, connection):
-    self._connection = connection
-
-    self._outside_portno = connection.ports[self.outside_port].port_no
-
-    fm = of.ofp_flow_mod()
-    fm.match.in_port = self._outside_portno
-    fm.priority = 1
-    connection.send(fm)
-
-    fm = of.ofp_flow_mod()
-    fm.match.in_port = self._outside_portno
-    fm.match.dl_type = 0x800 # IP
-    fm.match.nw_dst = self.outside_ip
-    fm.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
-    fm.priority = 2
-    connection.send(fm)
-
-    connection.addListeners(self)
-
-    # Need to find gateway MAC -- send an ARP
-    self._arp_for_gateway()
-
-  def _arp_for_gateway (self):
-    log.debug('Attempting to ARP for gateway (%s)', self.gateway_ip)
-    self._ARPHelper_.send_arp_request(self._connection,
-                                      ip = self.gateway_ip,
-                                      port = self._outside_portno,
-                                      src_ip = self.outside_ip)
-
-  def _handle_ARPHelper_ARPReply (self, event):
-    if event.dpid != self.dpid: return
-    if event.port != self._outside_portno: return
-    if event.reply.protosrc == self.gateway_ip:
-      self._gateway_eth = event.reply.hwsrc
-      log.info("Gateway %s is %s", self.gateway_ip, self._gateway_eth)
-
-  def _handle_ARPHelper_ARPRequest (self, event):
-    if event.dpid != self.dpid: return
-
-    dstip = event.request.protodst
-    if event.port == self._outside_portno:
-      if dstip == self.outside_ip:
-        if self._connection is None:
-          log.warn("Someone tried to ARP us, but no connection yet")
+                print "***************TYPE {0}".format(str(packet.type))
+                print "VLAN_IDDD {0}".format(str(vlan_id))
+                install_flows(event=event, vlan=vlan_id, input_ip=None, trans_port=None, original_port=None)
+                return
+            return
         else:
-          event.reply = self._outside_eth
+            print "Not an ipv4 packet"
     else:
-      if dstip == self.inside_ip or not self._is_local(dstip):
-        if self._connection is None:
-          log.warn("Someone tried to ARP us, but no connection yet")
-        else:
-          #event.reply = self._connection.eth_addr
-          event.reply = self._connection.ports[event.port].hw_addr
+        log.info("%s ARP %s %s => %s", dpid_to_str(dpid),
+
+                 {arp.REQUEST: "request", arp.REPLY: "reply"}.get(a.opcode,
+
+                                                                  'op:%i' % (a.opcode,)), str(a.protosrc),
+                 str(a.protodst))
+
+        if a.prototype == arp.PROTO_TYPE_IP:
+
+            if a.hwtype == arp.HW_TYPE_ETHERNET:
+
+                if a.opcode == arp.REQUEST:
+
+                    if str(a.protodst) == "192.168.1.1":
+                        r = arp()
+
+                        r.hwtype = a.hwtype
+
+                        r.prototype = a.prototype
+
+                        r.hwlen = a.hwlen
+
+                        r.protolen = a.protolen
+
+                        r.opcode = arp.REPLY
+
+                        r.hwdst = a.hwsrc
+
+                        r.protodst = a.protosrc
+                        r.protosrc = a.protodst
+
+                        r.hwsrc = EthAddr("00:00:00:00:00:03")
+
+                        e = ethernet(type=packet.type, src=r.hwsrc,
+
+                                     dst=a.hwsrc)
+
+                        e.payload = r
+
+                        log.info("%s answering ARP for %s" % (dpid_to_str(dpid),
+
+                                                              str(r.protosrc)))
+
+                        msg = of.ofp_packet_out()
+
+                        msg.data = e.pack()
+
+                        msg.actions.append(of.ofp_action_output(port=
+
+                                                                of.OFPP_IN_PORT))
+
+                        msg.in_port = inport
+
+                        event.connection.send(msg)
+
+                    if str(a.protodst) == "10.0.0.2":
+                        r = arp()
+
+                        r.hwtype = a.hwtype
+
+                        r.prototype = a.prototype
+
+                        r.hwlen = a.hwlen
+
+                        r.protolen = a.protolen
+
+                        r.opcode = arp.REPLY
+
+                        r.hwdst = a.hwsrc
+
+                        r.protodst = a.protosrc
+
+                        r.protosrc = a.protodst
+
+                        r.hwsrc = EthAddr("00:00:00:00:00:04")
+
+                        e = ethernet(type=packet.type, src=r.hwsrc,
+
+                                     dst=a.hwsrc)
+
+                        e.payload = r
+
+                        log.info("%s answering ARP for %s" % (dpid_to_str(dpid),
+
+                                                              str(r.protosrc)))
+
+                        msg = of.ofp_packet_out()
+
+                        msg.data = e.pack()
+
+                        msg.actions.append(of.ofp_action_output(port=
+
+                                                                of.OFPP_IN_PORT))
+
+                        msg.in_port = inport
+
+                        event.connection.send(msg)
 
 
-class NATDHCPD (DHCPD):
-  """
-  Subclass of the DHCP daemon for NAT
+def launch():
+    log.info("*** Starting... ***")
 
-  Basically it's the normal DHCP server, but it works on one specific DPID and
-  can ignore a particular port.
-  """
-  def __init__ (self, dpid, outside_port, *args, **kw):
-    self._outside_port_name = outside_port
-    self._outside_port_no = None
-    self._dpid = dpid
-    super(NATDHCPD,self).__init__(*args,**kw)
+    log.info("*** Waiting for switches to connect.. ***")
 
-  def _handle_ConnectionUp (self, event):
-    if self._dpid != event.dpid: return
-    ports = event.connection.ports
-    if self._outside_port_name not in ports:
-      log.warn("No port %s on DPID %s", self._outside_port_name,
-          dpid_to_str(self._dpid))
-      return
-    self._outside_port_no = ports[self._outside_port_name].port_no
+    core.openflow.addListenerByName("ConnectionUp", _handle_ConnectionUp)
 
-    return super(NATDHCPD,self)._handle_ConnectionUp(event)
-
-  def _handle_PacketIn (self, event):
-    if self._dpid != event.dpid: return
-    if event.port == self._outside_port_no: return
-    return super(NATDHCPD,self)._handle_PacketIn(event)
-
-
-def launch (dpid, outside_port, subnet = '172.16.1.0/24',
-            inside_ip = '172.16.1.1'):
-
-  import pox.proto.dhcp_client as dc
-  dc.launch(dpid = dpid, port = outside_port, port_eth = True)
-
-  import pox.proto.arp_helper as ah
-  ah.launch(use_port_mac = True)
-
-  dpid = str_to_dpid(dpid)
-  inside_ip = IPAddr(inside_ip)
-
-  pool = SimpleAddressPool(network = subnet, first = 100, last = 199)
-
-  core.registerNew(NATDHCPD, install_flow = True, pool = pool,
-                   ip_address = inside_ip, router_address = inside_ip,
-                   dns_address = inside_ip, dpid = dpid,
-                   outside_port = outside_port)
-
-
-  def got_lease (event):
-    outside_ip = event.lease.address
-
-    if not event.lease.routers:
-      log.error("Can't start NAT because we didn't get an upstream gateway")
-      return
-    gateway_ip = event.lease.routers[0]
-
-    if event.lease.dns_servers:
-      dns_ip = event.lease.dns_servers[0]
-    else:
-      dns_ip = None
-
-    log.debug('Starting NAT')
-
-    n = NAT(inside_ip, outside_ip, gateway_ip, dns_ip, outside_port, dpid,
-            subnet=subnet)
-    core.register(n)
-
-
-  def init ():
-    log.debug('Waiting for DHCP lease on port %s', outside_port)
-    core.DHCPClient.addListenerByName('DHCPLeased', got_lease)
-
-  core.call_when_ready(init, ['DHCPClient'])
+    core.openflow.addListenerByName("PacketIn", _handle_PacketIn)
