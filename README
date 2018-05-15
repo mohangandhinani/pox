@@ -1,7 +1,9 @@
-*************** To run the topology*************
-sudo python test.py
-*************To run the controller ************
+*************Commands to execute ************
+1)First run the controller using the below command
 sudo ./pox.py misc.nat log.level --DUBUG
-*********To edit the blocked hosts ************
-append ips to block in in the blocked.txt file
-allowed ips are - 192.168.1.10,192.168.1.11,192.168.1.12
+
+2) Run this command to start the topology
+  sudo python test.py
+
+3)Append ips to block in the blocked.txt file
+  allowed ips are - 192.168.1.10,192.168.1.11,192.168.1.12
